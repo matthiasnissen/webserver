@@ -29,6 +29,8 @@ export class OAuth2Model implements RefreshTokenModel {
     private readonly accessTokenLifetime: number = 60 * 60; // 1 hour
     private readonly refreshTokenLifetime: number = 60 * 60 * 24 * 30; // 30 days
     private readonly noBasicAuth: boolean; // Do not allow basic auth
+    private readonly accessTokenCookieName: string;
+    private readonly legacyAccessTokenCookieNames: string[];
     private adapter: ioBroker.Adapter;
     private bruteForce: Record<string, { errors: number; time: number }> = {};
 
@@ -40,6 +42,8 @@ export class OAuth2Model implements RefreshTokenModel {
      * @param options.accessLifetime Access token expiration in seconds
      * @param options.refreshLifeTime Refresh token expiration in seconds
      * @param options.noBasicAuth Do not allow basic authentication
+     * @param options.accessTokenCookieName Name of the access token cookie
+     * @param options.legacyAccessTokenCookieNames Previous access token cookie names to accept
      */
     constructor(
         adapter: ioBroker.Adapter,
@@ -47,12 +51,16 @@ export class OAuth2Model implements RefreshTokenModel {
             accessLifetime?: number;
             refreshLifeTime?: number;
             noBasicAuth?: boolean;
+            accessTokenCookieName?: string;
+            legacyAccessTokenCookieNames?: string[];
         },
     ) {
         this.adapter = adapter;
         this.accessTokenLifetime = options?.accessLifetime || this.accessTokenLifetime;
         this.refreshTokenLifetime = options?.refreshLifeTime || this.refreshTokenLifetime;
         this.noBasicAuth = options?.noBasicAuth || false;
+        this.accessTokenCookieName = options?.accessTokenCookieName || 'access_token';
+        this.legacyAccessTokenCookieNames = options?.legacyAccessTokenCookieNames || [];
     }
 
     getAccessToken = async (bearerToken: string): Promise<Token | Falsey> => {
@@ -128,10 +136,13 @@ export class OAuth2Model implements RefreshTokenModel {
             // If authentication by access token in a cookie
             if (!_req.user && _req.headers?.cookie) {
                 // If authenticated by cookie, like {headers: {cookie: "access_token=ACCESS_TOKEN"}}
-                const cookies = _req.headers.cookie.split(';').map(c => c.trim().split('='));
-                const tokenCookie = cookies.find(c => c[0] === 'access_token');
+                const cookies = _req.headers.cookie.split(';').map(cookie => cookie.trim());
+                const cookieNames = [this.accessTokenCookieName, ...this.legacyAccessTokenCookieNames];
+                const tokenCookie = cookieNames
+                    .map(cookieName => cookies.find(cookie => cookie.startsWith(`${cookieName}=`)))
+                    .find((cookie): cookie is string => cookie !== undefined);
                 if (tokenCookie) {
-                    const token = await this.getAccessToken(tokenCookie[1]);
+                    const token = await this.getAccessToken(tokenCookie.slice(tokenCookie.indexOf('=') + 1));
                     if (token) {
                         _req.user = token.user.id;
                     }

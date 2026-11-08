@@ -164,6 +164,7 @@ function createAdapter(linkedUsers) {
             const user = Object.keys(TOKENS).find(name => `a:${TOKENS[name]}` === id);
             callback(user ? { user, aToken: TOKENS[user], aExp: Date.now() + 3_600_000 } : null);
         },
+        destroySession: (_id, callback) => callback?.(),
         getForeignObjectAsync: async id =>
             id === 'system.group.administrator'
                 ? { _id: id, type: 'group', common: { name: 'Administrator', members: ADMINISTRATORS }, native: {} }
@@ -184,6 +185,7 @@ function createAdapter(linkedUsers) {
 async function startApp(adapter, oidc, extraOptions = {}) {
     const app = express();
     const model = createOAuth2Server(adapter, { app, oidc, ...extraOptions });
+    app.get('/whoami', (req, res) => res.json({ user: req.user }));
 
     // Issuing a real token needs the object database, which is not what these tests are about
     model.generateTokens = async userId => ({
@@ -365,6 +367,41 @@ describe('single sign-on with OpenID Connect', function () {
             assert.match(cookie, /HttpOnly/i, `not readable by scripts: ${cookie}`);
             assert.match(cookie, /SameSite=Lax/i, `not sent along cross-site requests: ${cookie}`);
             assert.doesNotMatch(cookie, /Secure/i, `plain http cannot have a secure cookie: ${cookie}`);
+        });
+
+        it('uses the configured cookie name for authentication and logout', async () => {
+            const cookieName = 'web.0.access_token';
+            await app.stop();
+            app = await startApp(
+                adapter,
+                { issuer, clientId: CLIENT_ID },
+                {
+                    accessTokenCookieName: cookieName,
+                    legacyAccessTokenCookieNames: ['access_token'],
+                },
+            );
+            linkedUsers['system.user.admin'] = USER_SUB;
+
+            const sso = await runFlow(`method=login&redirectUrl=${encodeURIComponent(`${app.base}/`)}`);
+            assert.match(sso.headers.get('set-cookie') || '', /^web\.0\.access_token=access-for-/);
+
+            const authenticated = await fetch(`${app.base}/whoami`, {
+                headers: { cookie: `${cookieName}=${TOKENS.admin}` },
+            });
+            assert.deepStrictEqual(await authenticated.json(), { user: 'admin' });
+
+            const genericCookie = await fetch(`${app.base}/whoami`, {
+                headers: { cookie: `access_token=${TOKENS.admin}` },
+            });
+            assert.deepStrictEqual(await genericCookie.json(), { user: 'admin' });
+
+            const logout = await fetch(`${app.base}/logout`, {
+                headers: { cookie: `access_token=${TOKENS.admin}` },
+                redirect: 'manual',
+            });
+            const clearedCookies = logout.headers.get('set-cookie') || '';
+            assert.match(clearedCookies, /web\.0\.access_token=;/);
+            assert.match(clearedCookies, /access_token=;/);
         });
 
         it('signs nobody in for an identity that belongs to no ioBroker user', async () => {

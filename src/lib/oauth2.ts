@@ -403,6 +403,8 @@ async function isAdministrator(adapter: ioBroker.Adapter, user: string): Promise
  * @param options.oidc Identity provider for the single sign-on. Without it, `/sso` does not exist.
  * @param options.ssoHandoff How the result of the single sign-on gets to the page: `url` (default) puts the tokens into the URL
  *   (`?ssoLoginResponse=` or `?id_token=`), `code` puts only a one-time `?ssoCode=` there, which the page exchanges via `POST /sso-token`
+ * @param options.accessTokenCookieName Name of the cookie set for and used to authenticate an access token (default: `access_token`)
+ * @param options.legacyAccessTokenCookieNames Previous access token cookie names to accept during migration
  */
 export function createOAuth2Server(
     adapter: ioBroker.Adapter,
@@ -420,13 +422,19 @@ export function createOAuth2Server(
         productName?: string;
         oidc?: OidcConfig;
         ssoHandoff?: 'url' | 'code';
+        accessTokenCookieName?: string;
+        legacyAccessTokenCookieNames?: string[];
     },
 ): OAuth2Model {
     const model = new OAuth2Model(adapter, {
         accessLifetime: options.accessLifetime,
         refreshLifeTime: options.refreshLifetime,
         noBasicAuth: options.noBasicAuth,
+        accessTokenCookieName: options.accessTokenCookieName,
+        legacyAccessTokenCookieNames: options.legacyAccessTokenCookieNames,
     });
+    const accessTokenCookieName = options.accessTokenCookieName || 'access_token';
+    const accessTokenCookieNames = [accessTokenCookieName, ...(options.legacyAccessTokenCookieNames || [])];
 
     const oauth = new OAuth2Server({
         model,
@@ -597,7 +605,7 @@ export function createOAuth2Server(
                     // The same flags as for a password login, apart from `sameSite`: the browser comes
                     // back from the identity provider, and a `strict` cookie would not be sent along
                     // this redirect chain, so the page would load as if nobody had signed in
-                    res.cookie('access_token', responseToken.access_token, {
+                    res.cookie(accessTokenCookieName, responseToken.access_token, {
                         httpOnly: true,
                         secure: options.secure || login.redirectUri.startsWith('https:'),
                         sameSite: 'lax',
@@ -722,8 +730,8 @@ export function createOAuth2Server(
                     cookieOptions.maxAge = Math.max(0, token.accessTokenExpiresAt.getTime() - Date.now());
                 }
 
-                // Store the access token in a cookie named "access_token"
-                res.cookie('access_token', token.accessToken, cookieOptions);
+                // Store the access token in the configured cookie
+                res.cookie(accessTokenCookieName, token.accessToken, cookieOptions);
 
                 res.json(oauthTokenToResponse(token));
             })
@@ -733,47 +741,49 @@ export function createOAuth2Server(
     }
 
     options.app.get('/logout', (req: Request, res: Response, next: NextFunction): void => {
-        let accessToken = req.headers.cookie?.split(';').find(c => c.trim().startsWith('access_token='));
-        if (accessToken) {
-            accessToken = accessToken.split('=')[1];
-        } else if (req.query.token) {
-            accessToken = req.query.token as string;
-        } else if (req.headers.authorization?.startsWith('Bearer ')) {
-            accessToken = req.headers.authorization.substring(7);
+        let accessToken: string | undefined;
+        let accessTokenCookie: string | undefined;
+        for (const cookieName of accessTokenCookieNames) {
+            accessTokenCookie = req.headers.cookie
+                ?.split(';')
+                .find(cookie => cookie.trim().startsWith(`${cookieName}=`));
+            if (accessTokenCookie) {
+                accessToken = accessTokenCookie.trim().slice(cookieName.length + 1);
+                break;
+            }
         }
+        if (!accessToken) {
+            if (req.query.token) {
+                accessToken = req.query.token as string;
+            } else if (req.headers.authorization?.startsWith('Bearer ')) {
+                accessToken = req.headers.authorization.substring(7);
+            }
+        }
+
+        const clearAccessTokenCookies = (): void => {
+            for (const cookieName of accessTokenCookieNames) {
+                res.clearCookie(cookieName);
+            }
+        };
+        const finishLogout = (): void => {
+            clearAccessTokenCookies();
+            if (options.loginPage) {
+                res.redirect(typeof options.loginPage === 'function' ? options.loginPage(req) : options.loginPage);
+            } else {
+                next();
+            }
+        };
 
         if (accessToken) {
             void adapter.getSession(`a:${accessToken}`, (obj: ioBroker.Session | null): void => {
-                res.clearCookie('access_token');
-
                 if (obj) {
                     void adapter.destroySession(`a:${obj.aToken}`);
                     void adapter.destroySession(`r:${obj.rToken}`);
                 }
-                // the answer will be sent in other middleware
-                if (options.loginPage) {
-                    if (typeof options.loginPage === 'function') {
-                        res.redirect(options.loginPage(req));
-                    } else {
-                        res.redirect(options.loginPage);
-                    }
-                } else {
-                    next();
-                }
+                finishLogout();
             });
         } else {
-            res.clearCookie('access_token');
-
-            // the answer will be sent in other middleware
-            if (options.loginPage) {
-                if (typeof options.loginPage === 'function') {
-                    res.redirect(options.loginPage(req));
-                } else {
-                    res.redirect(options.loginPage);
-                }
-            } else {
-                next();
-            }
+            finishLogout();
         }
     });
 
